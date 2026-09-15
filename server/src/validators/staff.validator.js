@@ -21,7 +21,20 @@ const createTeacherSchema = z.object({
         .optional(),
 });
 
-const updateTeacherSchema = createTeacherSchema.partial();
+// `status` is not on the create schema — a new teacher is always Active — but it
+// belongs here. Marking somebody Left is a DELETE (teacher.service.markLeft);
+// this is the only way back from a mis-click, and without it the mistake was
+// permanent.
+const updateTeacherSchema = createTeacherSchema
+    .partial()
+    .extend({ status: z.enum(['Active', 'Left']).optional() });
+
+// The staff register, filtered. Roster screens now offer Active / Left, and an
+// unvalidated status went straight into the query as whatever was typed.
+const listTeachersSchema = z.object({
+    status: z.enum(['Active', 'Left']).optional().or(z.literal('')).transform((v) => v || undefined),
+    search: z.string().trim().max(60).optional(),
+});
 
 // ---- attendance ----
 
@@ -99,6 +112,7 @@ const paySlipSchema = z.object({
 module.exports = {
     createTeacherSchema,
     updateTeacherSchema,
+    listTeachersSchema,
     markTeacherAttendanceSchema,
     markClassAttendanceSchema,
     generateSalarySchema,

@@ -49,7 +49,7 @@ const fromRequest = (req) => ({
 // it takes to start tracking it.
 // ---------------------------------------------------------------------------
 const TRACKED = {
-    Student: ['name', 'phone', 'altPhone', 'guardianName', 'address', 'class', 'className', 'monthlyFee', 'status'],
+    Student: ['name', 'dob', 'phone', 'altPhone', 'guardianName', 'motherName', 'address', 'class', 'className', 'monthlyFee', 'status', 'leftAt', 'leftReason'],
     Teacher: ['name', 'phone', 'designation', 'monthlySalary', 'lateAllowance', 'joiningDate', 'status', 'bankDetails'],
     SchoolClass: ['name', 'section', 'order', 'monthlyFee', 'isActive'],
     StockItem: ['name', 'category', 'unit', 'sellPrice', 'costPrice', 'lowStockAt', 'hasVariants', 'variants', 'isActive'],
@@ -57,7 +57,7 @@ const TRACKED = {
     Expense: ['title', 'paidTo', 'note', 'attachments'],
     Purchase: ['billDate', 'note', 'billImage'],
     Lead: ['name', 'guardianName', 'phone', 'altPhone', 'address', 'classInterested', 'source', 'status', 'nextFollowUp', 'note'],
-    AcademicSession: ['name', 'startDate', 'endDate', 'feeMonths', 'isActive'],
+    AcademicSession: ['name', 'startDate', 'endDate', 'feeMonths', 'isActive', 'idCardFee', 'openingBalance'],
     ExpenseCategory: ['name', 'isActive'],
     SalarySlip: ['advance', 'deductions', 'note', 'status', 'paidAmount', 'netPayable'],
     User: ['name', 'email', 'phone', 'role', 'isActive'],

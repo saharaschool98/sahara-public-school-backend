@@ -8,17 +8,20 @@ const {
     updateExpenseSchema,
     categorySchema,
     voidSchema,
+    byCategorySchema,
+    updateCategorySchema,
+    listCategoriesSchema,
 } = require('../../validators/finance.validator');
 const { idParamSchema } = require('../../validators/auth.validator');
 
 // ---- categories ----
-router.get('/categories', can('expense.view'), c.listCategories);
+router.get('/categories', can('expense.view'), validate(listCategoriesSchema, 'query'), c.listCategories);
 router.post('/categories', can('expense.create'), validate(categorySchema), c.createCategory);
-router.patch('/categories/:id', can('expense.edit'), validate(idParamSchema, 'params'), c.updateCategory);
+router.patch('/categories/:id', can('expense.edit'), validate(idParamSchema, 'params'), validate(updateCategorySchema), c.updateCategory);
 
 // ---- expenses ----
 router.get('/', can('expense.view'), c.listExpenses);
-router.get('/by-category', can('expense.view'), c.expensesByCategory);
+router.get('/by-category', can('expense.view'), validate(byCategorySchema, 'query'), c.expensesByCategory);
 router.get('/:id', can('expense.view'), validate(idParamSchema, 'params'), c.getExpense);
 
 router.post('/', can('expense.create'), validate(createExpenseSchema), c.createExpense);

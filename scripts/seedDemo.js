@@ -96,6 +96,15 @@ const FIRST = [
     'Ira', 'Riya', 'Aarohi', 'Isha', 'Meera', 'Tara', 'Nitya', 'Avni', 'Prisha', 'Siya',
     'Rahul', 'Priya', 'Amit', 'Neha', 'Suresh', 'Kavita', 'Vikram', 'Pooja', 'Sanjay', 'Anjali',
 ];
+// Mothers are picked from here rather than from FIRST, which is mixed — demo
+// data that names half the mothers Suresh reads as a bug on the first screen
+// anybody opens.
+const FEMALE_FIRST = [
+    'Ananya', 'Diya', 'Aadhya', 'Saanvi', 'Pari', 'Anika', 'Navya', 'Kiara', 'Myra', 'Sara',
+    'Ira', 'Riya', 'Aarohi', 'Isha', 'Meera', 'Tara', 'Nitya', 'Avni', 'Prisha', 'Siya',
+    'Priya', 'Neha', 'Kavita', 'Pooja', 'Anjali', 'Sunita', 'Rekha', 'Geeta', 'Seema', 'Nisha',
+];
+
 const LAST = [
     'Sharma', 'Verma', 'Gupta', 'Singh', 'Yadav', 'Kumar', 'Mishra', 'Pandey', 'Tiwari', 'Dubey',
     'Agarwal', 'Jain', 'Patel', 'Shah', 'Rathore', 'Chauhan', 'Thakur', 'Saxena', 'Srivastava', 'Joshi',
@@ -212,6 +221,7 @@ const run = async () => {
             name: n,
             nameLower: n.toLowerCase(),
             guardianName: `${pick(FIRST)} ${n.split(' ')[1]}`,
+            motherName: `${pick(FEMALE_FIRST)} ${n.split(' ')[1]}`,
             phone: phone(),
             address: address(),
             class: cls._id,
@@ -285,6 +295,7 @@ const run = async () => {
             name: n,
             nameLower: n.toLowerCase(),
             guardianName: `${pick(FIRST)} ${n.split(' ')[1]}`,
+            motherName: `${pick(FEMALE_FIRST)} ${n.split(' ')[1]}`,
             phone: phone(),
             address: address(),
             classInterested: pick(classes).name,

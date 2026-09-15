@@ -1,5 +1,6 @@
 const StockSale = require('../models/stockSale.model');
 const StockItem = require('../models/stockItem.model');
+const Transaction = require('../models/transaction.model');
 const StockMovement = require('../models/stockMovement.model');
 const Student = require('../models/student.model');
 const ApiError = require('../utils/ApiError');
@@ -37,8 +38,14 @@ const create = async (payload, actorId) => {
         if (!student) throw new ApiError(404, 'Student not found');
     }
 
-    // Validate every line AND check stock — all of it before any write
-    // begins. Nothing is worse than a half-completed sale.
+    // Validate every line AND price it — all of it before any write begins.
+    // Nothing is worse than a half-completed sale.
+    //
+    // The stock CHECK is deliberately not here. It is re-made inside the
+    // transaction below against the count at that moment, because this read is
+    // already stale by the time the write runs: two counters selling the last
+    // shirt both passed this check and the shelf went to -1. What this loop is
+    // for is resolving the rate and the labels, which do not move.
     const resolved = [];
     for (const line of lines) {
         const item = itemMap.get(line.item.toString());
@@ -62,7 +69,6 @@ const create = async (payload, actorId) => {
             qty: line.qty,
             rate: round2(rate),
             amount: round2(rate * line.qty),
-            balanceAfter: target.currentStock - line.qty,
         });
     }
 
@@ -93,7 +99,7 @@ const create = async (payload, actorId) => {
                     studentName: student?.name || 'Walk-in',
                     class: student?.class || null,
                     className: student?.className || '',
-                    lines: resolved.map(({ balanceAfter, ...l }) => l),
+                    lines: resolved,
                     subtotal,
                     discount: round2(discount),
                     total,
@@ -108,32 +114,46 @@ const create = async (payload, actorId) => {
             { session: mongoSession }
         );
 
-        // Reduce stock and write a movement for each line
+        // Reduce stock and write a movement for each line. The count is checked
+        // HERE, inside the transaction, against the item as it stands right now —
+        // a concurrent sale of the same size raises a write conflict, which
+        // withTransaction retries, and the retry sees the other sale's effect.
+        const movements = [];
+
         for (const line of resolved) {
+            const fresh = await StockItem.findById(line.item).session(mongoSession).lean();
+            const target = stockService.resolveStockTarget(fresh, line.variantId);
+
+            if (line.qty > target.currentStock) {
+                throw new ApiError(
+                    400,
+                    `${line.itemName}${line.variantLabel ? ` (${line.variantLabel})` : ''} has only ${target.currentStock} in stock`
+                );
+            }
+
             await stockService.applyStockDelta(
                 { itemId: line.item, variantId: line.variantId, delta: -line.qty },
                 mongoSession
             );
-        }
 
-        await StockMovement.insertMany(
-            resolved.map((l) => ({
+            movements.push({
                 session,
-                item: l.item,
-                itemName: l.itemName,
-                variantId: l.variantId,
-                variantLabel: l.variantLabel,
+                item: line.item,
+                itemName: line.itemName,
+                variantId: line.variantId,
+                variantLabel: line.variantLabel,
                 type: 'SALE_OUT',
-                qty: -l.qty,
-                rate: l.rate,
-                balanceAfter: l.balanceAfter,
+                qty: -line.qty,
+                rate: line.rate,
+                balanceAfter: target.currentStock - line.qty,
                 refModel: 'StockSale',
                 refId: sale._id,
                 date: saleDate,
                 by: actorId,
-            })),
-            { session: mongoSession }
-        );
+            });
+        }
+
+        await StockMovement.insertMany(movements, { session: mongoSession });
 
         // Only what was paid enters the cash ledger. The credit portion writes
         // no transaction yet — that comes when the money does.
@@ -203,6 +223,63 @@ const getById = async (id) => {
 };
 
 // ---------------------------------------------------------------------------
+// Changing what was PAID at the counter on a bill nobody has checked off yet.
+//
+// Not the bill — the items, the rates and the total are untouched. Only the
+// split between what was handed over and what the student still owes, which is
+// the figure the payment screen is looking at.
+//
+// The caller owns the session and the ledger row — see payment.service.update.
+// ---------------------------------------------------------------------------
+const revisePayment = async (txn, newAmount, mongoSession) => {
+    const value = round2(newAmount);
+
+    const sale = await StockSale.findById(txn.refId).session(mongoSession).lean();
+    if (!sale) throw new ApiError(404, 'The bill behind this payment no longer exists');
+    if (sale.voided) throw new ApiError(409, 'This bill has been voided');
+
+    // Money has come in against the credit half since. Moving the counter
+    // payment now would leave that receipt sitting against a balance that no
+    // longer adds up, and which of the two is wrong is a decision for a person.
+    if ((sale.duesReceived || 0) > 0) {
+        throw new ApiError(
+            409,
+            `₹${sale.duesReceived} has since been received against this bill — settle that receipt first`
+        );
+    }
+
+    if (value > sale.total) {
+        throw new ApiError(400, `The bill is ₹${sale.total} — the payment cannot be more than that`);
+    }
+
+    // The same rule create() enforces, for the same reason: there is nobody to
+    // chase a walk-in for the rest.
+    if (!sale.student && value < sale.total) {
+        throw new ApiError(400, 'A walk-in sale must be paid in full');
+    }
+
+    const delta = round2(value - txn.amount);
+
+    // Whatever was not handed over is what the student owes. Both halves move
+    // together, so the bill always reads paid + due = total.
+    await StockSale.updateOne(
+        { _id: sale._id },
+        { $inc: { paidAmount: delta, dueAmount: -delta } },
+        { session: mongoSession }
+    );
+
+    if (sale.student) {
+        await Student.updateOne(
+            { _id: sale.student },
+            { $inc: { stockOutstanding: -delta } },
+            { session: mongoSession }
+        );
+    }
+
+    return {};
+};
+
+// ---------------------------------------------------------------------------
 // Voiding a sale — stock back, outstanding back, and the cash portion
 // reversed in the ledger.
 // ---------------------------------------------------------------------------
@@ -224,7 +301,21 @@ const voidSale = async (id, reason, actor) => {
         );
     }
 
-    const Transaction = require('../models/transaction.model');
+    // Read before any work starts, so a bill whose receipt has been signed off
+    // is refused here rather than after the stock has gone back on the shelf.
+    // The flag only; the row itself is re-read inside the transaction below.
+    // Nothing found means the bill was pure credit — there is no seal to check.
+    const signedOff = await Transaction.findOne({
+        refModel: 'StockSale',
+        refId: sale._id,
+        receiptNo: null,
+        voided: false,
+    })
+        .select('verified')
+        .sort({ createdAt: 1 })
+        .lean();
+
+    ledger.assertUnsealed(signedOff);
 
     return withTransaction(async (mongoSession) => {
         await StockSale.updateOne(
@@ -233,32 +324,40 @@ const voidSale = async (id, reason, actor) => {
             { session: mongoSession }
         );
 
-        // Stock goes back in
+        // Stock goes back in. The balance AFTER each return is read back from
+        // the item, not guessed — the movement history's most-read column was
+        // being written as 0 on every void, so a voided sale looked like it had
+        // emptied the shelf.
+        const movements = [];
+
         for (const line of sale.lines) {
             await stockService.applyStockDelta(
                 { itemId: line.item, variantId: line.variantId, delta: line.qty },
                 mongoSession
             );
-        }
 
-        await StockMovement.insertMany(
-            sale.lines.map((l) => ({
+            const item = await StockItem.findById(line.item).session(mongoSession).lean();
+            const target = stockService.resolveStockTarget(item, line.variantId);
+
+            movements.push({
                 session: sale.session,
-                item: l.item,
-                itemName: l.itemName,
-                variantId: l.variantId,
-                variantLabel: l.variantLabel,
+                item: line.item,
+                itemName: line.itemName,
+                variantId: line.variantId,
+                variantLabel: line.variantLabel,
                 type: 'RETURN_IN',
-                qty: l.qty,
-                rate: l.rate,
+                qty: line.qty,
+                rate: line.rate,
+                balanceAfter: target.currentStock,
                 refModel: 'StockSale',
                 refId: sale._id,
                 note: `Void: ${reason.trim()}`,
                 date: new Date(),
                 by: actor.id,
-            })),
-            { session: mongoSession }
-        );
+            });
+        }
+
+        await StockMovement.insertMany(movements, { session: mongoSession });
 
         if (sale.dueAmount > 0 && sale.student) {
             await Student.updateOne(
@@ -349,23 +448,31 @@ const collectDues = async ({ studentId, amount, mode, txnDate, note = '' }, acto
     const student = await Student.findById(studentId).lean();
     if (!student) throw new ApiError(404, 'Student not found');
 
-    const bills = await unpaidBills(studentId);
-    const totalDue = round2(bills.reduce((acc, b) => acc + (b.dueAmount || 0), 0));
-
-    if (totalDue <= 0) throw new ApiError(400, 'This student has no stock dues outstanding');
-
-    // Never take more than is owed — an extra zero would leave a negative
-    // balance, and those only ever get fixed by hand afterwards.
-    if (value > totalDue) {
-        throw new ApiError(
-            400,
-            `Only ₹${totalDue} is outstanding — you cannot collect more than that`
-        );
-    }
-
-    const splits = allocate(value, bills.map((b) => b.dueAmount || 0));
-
     return withTransaction(async (mongoSession) => {
+        // The bills are read INSIDE the transaction and the allocation is built
+        // from what is read here — the same rule fee.service.collect follows, for
+        // the same reason. Reading first and writing afterwards let two counters
+        // allocate the same dueAmount twice and drive the balance negative.
+        const bills = await StockSale.find({ student: studentId, voided: false, dueAmount: { $gt: 0 } })
+            .sort({ date: 1 })
+            .session(mongoSession)
+            .lean();
+
+        const totalDue = round2(bills.reduce((acc, b) => acc + (b.dueAmount || 0), 0));
+
+        if (totalDue <= 0) throw new ApiError(400, 'This student has no stock dues outstanding');
+
+        // Never take more than is owed — an extra zero would leave a negative
+        // balance, and those only ever get fixed by hand afterwards.
+        if (value > totalDue) {
+            throw new ApiError(
+                400,
+                `Only ₹${totalDue} is outstanding — you cannot collect more than that`
+            );
+        }
+
+        const splits = allocate(value, bills.map((b) => b.dueAmount || 0));
+
         // The same receipt series as fees on purpose: the counter keeps one
         // receipt book, so two receipts must never share a number.
         const seq = await getNextSequence('receiptNo', session, mongoSession);
@@ -435,5 +542,5 @@ const collectDues = async ({ studentId, amount, mode, txnDate, note = '' }, acto
     });
 };
 
-module.exports = { create, list, getById, voidSale, duesForStudent, collectDues };
+module.exports = { create, list, getById, revisePayment, voidSale, duesForStudent, collectDues };
 

@@ -74,9 +74,9 @@ const teacherSheet = asyncHandler(async (req, res) => {
     return res.status(200).json(new ApiResponse(200, data, 'Attendance sheet'));
 });
 
-// Attendance drives payroll, so a correction made after a slip was generated
-// is exactly the kind of change somebody asks about later. The individual
-// marks are not copied — the sheet is the record; this says who saved it.
+// Attendance drives payroll and is sealed the moment it is saved, so this is
+// the record of who sealed it. The individual marks are not copied — the sheet
+// itself is that record; this says who saved it and how much was already locked.
 const markTeacherAttendance = asyncHandler(async (req, res) => {
     const data = await attendanceService.markTeachers(req.body, req.userId);
 
@@ -84,11 +84,13 @@ const markTeacherAttendance = asyncHandler(async (req, res) => {
         ...audit.fromRequest(req),
         action: 'attendance.teacher.mark',
         entity: 'TeacherAttendance',
-        summary: `${data.saved} teachers marked for ${new Date(data.date).toISOString().slice(0, 10)}`
-            + ` (${data.inserted} new, ${data.updated} changed)`,
+        summary: `${new Date(data.date).toISOString().slice(0, 10)}: ${data.saved} teachers marked`
+            + (data.locked ? ` · ${data.locked} already locked, left unchanged` : ''),
     });
 
-    return res.status(200).json(new ApiResponse(200, data, 'Attendance saved'));
+    return res
+        .status(200)
+        .json(new ApiResponse(200, data, data.saved ? 'Attendance saved and locked' : 'Nothing to save'));
 });
 
 const teacherGrid = asyncHandler(async (req, res) => {
@@ -108,11 +110,13 @@ const markClassAttendance = asyncHandler(async (req, res) => {
         ...audit.fromRequest(req),
         action: 'attendance.class.mark',
         entity: 'ClassAttendance',
-        summary: `${data.saved} classes marked for ${new Date(data.date).toISOString().slice(0, 10)}`
-            + ` (${data.inserted} new, ${data.updated} changed)`,
+        summary: `${new Date(data.date).toISOString().slice(0, 10)}: ${data.saved} classes marked`
+            + (data.locked ? ` · ${data.locked} already locked, left unchanged` : ''),
     });
 
-    return res.status(200).json(new ApiResponse(200, data, 'Attendance saved'));
+    return res
+        .status(200)
+        .json(new ApiResponse(200, data, data.saved ? 'Attendance saved and locked' : 'Nothing to save'));
 });
 
 const classMonthly = asyncHandler(async (req, res) => {
@@ -232,7 +236,7 @@ const paySlip = asyncHandler(async (req, res) => {
         action: 'salary.pay',
         entity: 'SalarySlip',
         entityId: req.params.id,
-        summary: `₹${data.paid} paid (₹${data.remaining})`,
+        summary: `₹${data.paid} paid · ₹${data.remaining} still to pay`,
     });
 
     return res.status(200).json(new ApiResponse(200, data, 'Salary paid'));

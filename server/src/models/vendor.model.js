@@ -10,7 +10,7 @@ const vendorSchema = new mongoose.Schema(
 
         // Denormalised — the "who do we owe" screen sorts on this.
         // Aggregating purchases minus payments would mean scanning two
-        // scanning two collections on every read.
+        // collections on every read.
         outstanding: { type: Number, default: 0 },
         totalPurchased: { type: Number, default: 0 },
         totalPaid: { type: Number, default: 0 },

@@ -10,6 +10,7 @@ const {
     hashToken,
 } = require('../utils/tokens');
 const { config } = require('../config/env');
+const { READ_ONLY_ROLES } = require('../utils/permissions');
 
 // Create the refresh token row
 const issueRefreshToken = async (user, meta = {}) => {
@@ -40,6 +41,11 @@ const buildAuthPayload = async (user) => {
             username: user.username,
             role: user.role,
             mustChangePassword: user.mustChangePassword,
+            // This account can view everything and change nothing. Sent as a flag
+            // rather than left for the browser to infer from the role name, so
+            // the screens never carry a hardcoded list of role names — the same
+            // reason every gate asks for a capability instead of a role.
+            readOnly: READ_ONLY_ROLES.has(user.role),
         },
         permissions: [...grants],
         // What the deployment can actually do. Image upload is optional, and
@@ -88,7 +94,6 @@ const login = async ({ username, password }, meta = {}) => {
 // token is used again, that token is in somebody else's hands (stolen) —
 // in which case ALL of that user's sessions are revoked. The legitimate
 // user simply signs in again; the thief is left with nothing.
-// 
 // ---------------------------------------------------------------------------
 const refresh = async (token, meta = {}) => {
     if (!token) throw new ApiError(401, 'Session not found — please sign in again').withCode('NO_REFRESH');

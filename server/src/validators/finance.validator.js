@@ -35,6 +35,58 @@ const discountSchema = z.object({
 
 const voidSchema = z.object({ reason });
 
+// Handing an advance back. A mode because the money physically leaves by some
+// route, and a reason because it always does for money going out.
+const refundCreditSchema = z.object({
+    amount: positiveMoney,
+    mode: paymentMode,
+    reason,
+});
+
+// /fees/pending/:studentId names its param studentId, so idParamSchema (which
+// only mentions `id`) cannot validate it — and because validate() assigns the
+// PARSED object back over req.params, reusing it would have deleted the param
+// outright.
+const studentIdParamSchema = z.object({ studentId: objectId });
+
+// The month is the whole query. Without it the aggregation matched
+// `month: undefined`, which serialises to null, matches nothing, and answered
+// an empty report instead of saying what was missing.
+const byCategorySchema = z.object({ month: monthKey });
+
+// The dashboard's period. Anything else — or nothing — means the month, which
+// is what this screen has always shown.
+const dashboardSchema = z.object({
+    period: z.enum(['today', 'week', 'month']).optional().or(z.literal('')).transform((v) => v || undefined),
+});
+
+// The day book, over a date range. Both ends optional: nothing at all means
+// today (the dashboard's "Today" card relies on that), and one end alone means
+// that single day. The service caps how wide the range may be — see
+// MAX_DAYBOOK_DAYS.
+const daybookSchema = z.object({
+    from: dateish.optional(),
+    to: dateish.optional(),
+});
+
+// The cash book. `session` is optional — left out, the active one is used;
+// given, it opens that year's book. The empty string is turned into "not
+// given", because a <select> whose first option is "current session" sends one.
+const cashbookSchema = z.object({
+    session: z
+        .string()
+        .trim()
+        .regex(/^\d{4}-\d{2}$/, 'Session must be in 2026-27 format')
+        .optional()
+        .or(z.literal(''))
+        .transform((v) => v || undefined),
+});
+
+// The picker asks for live heads only; the management list asks for all of them.
+const listCategoriesSchema = z.object({
+    includeInactive: z.enum(['true', 'false']).optional(),
+});
+
 const listDemandsSchema = z.object({
     ...pagination,
     month: monthKey.optional(),
@@ -57,6 +109,26 @@ const listPaymentsSchema = z.object({
         .or(z.literal(''))
         .transform((v) => v || undefined),
 });
+
+// Correcting an entry nobody has signed off yet. Every field optional, but at
+// least one has to be there — a PATCH that changes nothing should be told so
+// rather than quietly writing an empty history row.
+//
+// `paymentMode` and not the Transaction enum: 'Adjustment' is a bookkeeping
+// mode for money that never moved, and no counter slip is ever one.
+//
+// The amount has no ceiling here, deliberately. What a receipt may be raised to
+// depends on what the student still owes or what the bill comes to, and only
+// the module holding those records knows it — a number invented in a validator
+// would either be wrong or would have to be kept in step with four services.
+// They refuse with the real figure instead.
+const updatePaymentSchema = z
+    .object({
+        mode: paymentMode.optional(),
+        note: z.string().trim().max(200).optional().or(z.literal('')),
+        amount: positiveMoney.optional(),
+    })
+    .refine((d) => Object.keys(d).length > 0, 'Change the amount, the mode or the note');
 
 // ---- expenses ----
 
@@ -81,6 +153,15 @@ const updateExpenseSchema = z.object({
 const categorySchema = z.object({
     name: z.string().trim().min(2, 'Enter the category name').max(60),
 });
+
+// Renaming a head, or retiring one. `isActive: false` keeps it off the picker
+// while every expense already filed under it stays exactly where it is.
+const updateCategorySchema = z
+    .object({
+        name: z.string().trim().min(2, 'Enter the category name').max(60).optional(),
+        isActive: z.boolean().optional(),
+    })
+    .refine((d) => Object.keys(d).length > 0, 'Provide at least one field to update');
 
 // ---- vendors ----
 
@@ -151,7 +232,14 @@ const listPurchasesSchema = z.object({
 });
 
 module.exports = {
+    refundCreditSchema,
     listPaymentsSchema,
+    updatePaymentSchema,
+    studentIdParamSchema,
+    byCategorySchema,
+    dashboardSchema,
+    daybookSchema,
+    cashbookSchema,
     generateFeesSchema,
     collectFeeSchema,
     discountSchema,
@@ -160,6 +248,8 @@ module.exports = {
     createExpenseSchema,
     updateExpenseSchema,
     categorySchema,
+    updateCategorySchema,
+    listCategoriesSchema,
     createVendorSchema,
     updateVendorSchema,
     payVendorSchema,

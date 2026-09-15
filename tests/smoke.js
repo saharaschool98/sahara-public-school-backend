@@ -15,6 +15,9 @@ const Student = require('../server/src/models/student.model');
 const MonthlyRollup = require('../server/src/models/monthlyRollup.model');
 const StockItem = require('../server/src/models/stockItem.model');
 const Vendor = require('../server/src/models/vendor.model');
+const SchoolClass = require('../server/src/models/schoolClass.model');
+const Charge = require('../server/src/models/charge.model');
+const ChargeDemand = require('../server/src/models/chargeDemand.model');
 
 const permissionService = require('../server/src/services/permission.service');
 const sessionService = require('../server/src/services/session.service');
@@ -28,9 +31,11 @@ const purchaseService = require('../server/src/services/purchase.service');
 const teacherService = require('../server/src/services/teacher.service');
 const attendanceService = require('../server/src/services/attendance.service');
 const salaryService = require('../server/src/services/salary.service');
+const chargeService = require('../server/src/services/charge.service');
 const reportService = require('../server/src/services/report.service');
 const { sessionCache, permissionCache } = require('../server/src/utils/ttlCache');
 const { monthKeyIST, isSundayIST } = require('../server/src/utils/istDate');
+const { round2 } = require('../server/src/utils/money');
 
 // Fees are RAISED for August, but the money is RECEIVED today. Those are two
 // different rollup months whenever the suite runs outside August, so the
@@ -81,13 +86,50 @@ const section = (t) => console.log(`\n== ${t}`);
 
   ok('Admission numbers sequential', s1.admissionNo === 'ADM0001' && s2.admissionNo === 'ADM0002', `${s1.admissionNo}, ${s2.admissionNo}`);
   ok('Class default fee applied', s1.monthlyFee === 1200, `₹${s1.monthlyFee}`);
+
+  // Both parents and a second number — an admission form asks for all of it, and
+  // it has to survive the round trip rather than being quietly dropped.
+  //
+  // Created, checked and REMOVED again: every count from here on (the class
+  // roster, the demands raised, the rollup, the attendance percentage) is
+  // asserted exactly, so an extra student left lying around fails five later
+  // assertions that have nothing to do with parents' names.
+  {
+    const full = await studentService.create({
+      name: 'Full Record',
+      guardianName: 'Rajesh Sharma',
+      motherName: 'Sunita Sharma',
+      phone: '9811100011',
+      altPhone: '9811100022',
+      address: '12 Station Road',
+      class: cls._id,
+      admissionDate: new Date('2026-04-01'),
+    }, admin._id);
+
+    ok("The mother's name is stored", full.motherName === 'Sunita Sharma', full.motherName);
+    ok('The second number is stored', full.altPhone === '9811100022', full.altPhone);
+    ok('The father / guardian is stored', full.guardianName === 'Rajesh Sharma');
+
+    const readBack = (await studentService.getLedger(full._id)).student;
+    ok('...and all of it comes back on the profile',
+       readBack.motherName === 'Sunita Sharma'
+       && readBack.altPhone === '9811100022'
+       && readBack.guardianName === 'Rajesh Sharma');
+
+    await studentService.update(full._id, { motherName: 'Sunita Devi Sharma' }, admin._id);
+    ok("The mother's name is editable",
+       (await Student.findById(full._id).select('motherName').lean()).motherName === 'Sunita Devi Sharma');
+
+    await Student.deleteOne({ _id: full._id });
+    await SchoolClass.updateOne({ _id: cls._id }, { $inc: { studentCount: -1 } });
+  }
   ok('Per-student override applied', s3.monthlyFee === 1000, `₹${s3.monthlyFee}`);
   ok('Class studentCount went up', (await classService.getById(cls._id)).studentCount === 2);
 
   // ---------- fee generation + IDEMPOTENCY ----------
   section('Fee generation (idempotency)');
   const g1 = await feeService.generateMonth({ month: '2026-08' }, admin._id);
-  ok('3 demands bane', g1.created === 3, `₹${g1.totalRaised} raised`);
+  ok('3 demands raised', g1.created === 3, `₹${g1.totalRaised} raised`);
 
   const g2 = await feeService.generateMonth({ month: '2026-08' }, admin._id);
   ok('Re-running created 0 (IDEMPOTENT)', g2.created === 0, `skipped ${g2.skipped}`);
@@ -114,15 +156,16 @@ const section = (t) => console.log(`\n== ${t}`);
   const clsRoll = await MonthlyRollup.findOne({ month: NOW, scope: 'CLASS', class: cls._id }).lean();
   ok('Class rollup updated too', clsRoll.feeCollected === 700, `₹${clsRoll.feeCollected}`);
 
-  // overpay guard
+  // Paying ahead is allowed; paying a fantasy figure is not. The ceiling is
+  // what the rest of the session actually costs — see fee.service.advanceRoom.
   let overpayBlocked = false;
   try { await feeService.collect({ studentId: s1._id, amount: 99999, mode: 'Cash' }, actor); }
   catch { overpayBlocked = true; }
-  ok('Collecting more than due is blocked', overpayBlocked);
+  ok('Collecting far past the whole session is blocked', overpayBlocked);
 
   // ---------- discount ----------
   section('Discount');
-  const demands = await feeService.pendingForStudent(s2._id);
+  const { demands } = await feeService.pendingForStudent(s2._id);
   await feeService.applyDiscount(demands[0]._id, { amount: 200, reason: 'Sibling concession' }, actor);
   const st2 = await Student.findById(s2._id).lean();
   ok('Discount reduced the outstanding', st2.feeOutstanding === 1000, `₹${st2.feeOutstanding}`);
@@ -276,10 +319,247 @@ const section = (t) => console.log(`\n== ${t}`);
   const cSheet = await attendanceService.getClassSheet(new Date(Date.UTC(2026, 7, 20, 6)));
   ok('Class attendance marked', cSheet.totals.present === 3 && cSheet.totals.roll === 3, `${cSheet.totals.percent}%`);
 
+  // A fixed weekday, not new Date() — a Sunday is refused outright now, so
+  // "today" would have made this assertion pass for the wrong reason.
   let tooMany = false;
-  try { await attendanceService.markClasses({ date: new Date(), entries: [{ class: cls._id, present: 99 }] }, admin._id); }
-  catch { tooMany = true; }
+  try {
+    await attendanceService.markClasses(
+      { date: new Date(Date.UTC(2026, 7, 21, 6)), entries: [{ class: cls._id, present: 99 }] },
+      admin._id
+    );
+  } catch { tooMany = true; }
   ok('Present exceeding roll is blocked', tooMany);
+
+  // ---------- the attendance lock ----------
+  //
+  // Once a day is saved it is sealed. These four assertions are the whole rule:
+  // a second save changes nothing, it is reported rather than thrown, a teacher
+  // with no row yet can still be marked, and a Sunday is refused outright.
+  section('Attendance is locked once marked');
+
+  const lockDate = new Date(Date.UTC(2026, 7, 20, 6)); // the Thursday marked above
+
+  const relock = await attendanceService.markClasses({
+    date: lockDate,
+    entries: [{ class: cls._id, present: 1 }],
+  }, admin._id);
+  ok('Re-marking a class writes nothing', relock.saved === 0 && relock.locked === 1, JSON.stringify(relock.warning));
+
+  const afterRelock = await attendanceService.getClassSheet(lockDate);
+  ok('The original figure survived', afterRelock.totals.present === 3, `${afterRelock.totals.present}`);
+  ok('The sheet reports itself locked', afterRelock.rows.every((r) => r.locked), `${afterRelock.lockedCount} locked`);
+
+  const tLock = new Date(Date.UTC(2026, 7, 3, 6)); // a Monday, marked in the loop above
+  const tRelock = await attendanceService.markTeachers({
+    date: tLock,
+    entries: [{ teacher: t1._id, status: 'Absent' }],
+  }, admin._id);
+  ok('Re-marking a teacher writes nothing', tRelock.saved === 0 && tRelock.locked === 1);
+
+  const tSheet = await attendanceService.getTeacherSheet(tLock);
+  ok('The teacher keeps the status they were marked with',
+     tSheet.rows.find((r) => r.name === 'Sunita Rao').status === 'Present');
+
+  // A teacher who joined after the sheet was saved has no row for that day, so
+  // their day can still be marked — the lock is per teacher, not per sheet.
+  const t3 = await teacherService.create(
+    { name: 'Late Joiner', monthlySalary: 12000, joiningDate: new Date('2026-08-10') },
+    admin._id
+  );
+  const partial = await attendanceService.markTeachers({
+    date: tLock,
+    entries: [{ teacher: t1._id, status: 'Absent' }, { teacher: t3._id, status: 'Present' }],
+  }, admin._id);
+  ok('A teacher with no row yet can still be marked', partial.saved === 1 && partial.locked === 1);
+
+  let sundayRefused = false;
+  try {
+    await attendanceService.markTeachers(
+      { date: new Date(Date.UTC(2026, 7, 2, 6)), entries: [{ teacher: t1._id, status: 'Present' }] },
+      admin._id
+    );
+  } catch (e) { sundayRefused = e.code === 'SUNDAY_NOT_MARKED'; }
+  ok('A Sunday is refused outright', sundayRefused);
+
+  // ---------- other fees ----------
+  //
+  // Admission, exams, trips. The assertions that matter are the ones that make
+  // it safe: raising is idempotent, the money lands in its own rollup head and
+  // not in the fee figure, a void is the exact inverse of its own collection,
+  // and a cancel is refused once anybody has paid.
+  section('Other fees');
+
+  const examHead = await chargeService.createHead({ name: 'Exam Fee', defaultAmount: 500 }, admin._id);
+  ok('A head is created', examHead.name === 'Exam Fee' && examHead.defaultAmount === 500);
+
+  let dupeHead = false;
+  try { await chargeService.createHead({ name: 'exam fee' }, admin._id); } catch { dupeHead = true; }
+  ok('A duplicate head is refused, case-insensitively', dupeHead);
+
+  const before = await Student.findById(s1._id).select('chargeOutstanding feeOutstanding').lean();
+
+  const raised = await chargeService.raise({
+    headId: examHead._id, title: 'Term 1', amount: 500, scope: 'CLASS', classIds: [cls._id],
+  }, admin._id);
+  ok('Raised on the class', raised.raisedFor === 2 && raised.totalRaised === 1000, `${raised.raisedFor} students`);
+
+  const afterRaise = await Student.findById(s1._id).select('chargeOutstanding feeOutstanding').lean();
+  ok('It lands on chargeOutstanding', afterRaise.chargeOutstanding === before.chargeOutstanding + 500,
+     `₹${afterRaise.chargeOutstanding}`);
+  ok('...and NOT on the monthly fee outstanding', afterRaise.feeOutstanding === before.feeOutstanding);
+
+  // Idempotency, the same guarantee fee generation has.
+  const topUpAgain = await chargeService.topUp(raised.charge._id, admin._id);
+  ok('Topping up adds nobody who already has it', topUpAgain.added === 0);
+
+  // A student admitted after it went out.
+  const late = await studentService.create(
+    { name: 'Late Admission', phone: '9844444444', class: cls._id, admissionDate: new Date('2026-09-01') },
+    admin._id
+  );
+  const topUp2 = await chargeService.topUp(raised.charge._id, admin._id);
+  ok('Topping up picks up a later admission', topUp2.added === 1, `${topUp2.added} added`);
+  ok('Their balance moved too',
+     (await Student.findById(late._id).select('chargeOutstanding').lean()).chargeOutstanding === 500);
+
+  // Collecting — its own rollup head, the shared receipt series.
+  const rollupBefore = await MonthlyRollup.findOne({ month: NOW, scope: 'SCHOOL', class: null }).lean();
+
+  const rcpt = await chargeService.collect(
+    { studentId: s1._id, amount: 500, mode: 'Cash' },
+    { id: admin._id, name: 'Admin' }
+  );
+  ok('A receipt is issued off the shared series', /^RCP\d{5}$/.test(rcpt.receiptNo), rcpt.receiptNo);
+  ok('It records what it paid', rcpt.covered.length === 1 && rcpt.covered[0].amount === 500);
+
+  const rollupAfter = await MonthlyRollup.findOne({ month: NOW, scope: 'SCHOOL', class: null }).lean();
+  ok('It reaches its OWN rollup head',
+     round2((rollupAfter.chargeCollected || 0) - (rollupBefore?.chargeCollected || 0)) === 500,
+     `₹${rollupAfter.chargeCollected}`);
+  ok('...and not the fee head',
+     round2((rollupAfter.feeCollected || 0) - (rollupBefore?.feeCollected || 0)) === 0);
+  ok('Cash in moved', round2((rollupAfter.cashIn || 0) - (rollupBefore?.cashIn || 0)) === 500);
+
+  ok('The student no longer owes it',
+     (await Student.findById(s1._id).select('chargeOutstanding').lean()).chargeOutstanding
+       === before.chargeOutstanding);
+
+  let tooMuch = false;
+  try { await chargeService.collect({ studentId: s1._id, amount: 100, mode: 'Cash' }, { id: admin._id }); }
+  catch { tooMuch = true; }
+  ok('Collecting with nothing outstanding is refused', tooMuch);
+
+  // Cancelling is refused once money has come in — those receipts would be
+  // left pointing at nothing.
+  let cancelBlocked = false;
+  try { await chargeService.cancel(raised.charge._id, 'wrong amount', admin._id); }
+  catch (e) { cancelBlocked = e.code === 'ALREADY_COLLECTED'; }
+  ok('A charge with money against it cannot be cancelled', cancelBlocked);
+
+  // Voiding: the exact inverse of the collection that wrote it.
+  const voided = await chargeService.voidReceipt(rcpt.transactionId, 'cheque bounced', { id: admin._id });
+  ok('The receipt is voided', voided.amount === 500 && voided.reversed === 500);
+  ok('The money goes back on the student',
+     (await Student.findById(s1._id).select('chargeOutstanding').lean()).chargeOutstanding
+       === before.chargeOutstanding + 500);
+
+  const rollupVoid = await MonthlyRollup.findOne({ month: NOW, scope: 'SCHOOL', class: null }).lean();
+  ok('The rollup came back down too',
+     round2((rollupVoid.chargeCollected || 0) - (rollupBefore?.chargeCollected || 0)) === 0,
+     `₹${rollupVoid.chargeCollected}`);
+
+  // A waiver is tracked, not hidden.
+  const oneDemand = await ChargeDemand.findOne({ charge: raised.charge._id, student: late._id }).lean();
+  await chargeService.applyDiscount(oneDemand._id, { amount: 500, reason: 'staff child' }, { id: admin._id });
+  const waived = await ChargeDemand.findById(oneDemand._id).lean();
+  ok('A waiver clears the demand', waived.status === 'Paid' && waived.discount === 500);
+  ok('...and comes off the balance',
+     (await Student.findById(late._id).select('chargeOutstanding').lean()).chargeOutstanding === 0);
+  ok('...and is counted as a waiver, not a collection',
+     (await Charge.findById(raised.charge._id).lean()).totalDiscount === 500);
+
+  // A charge raised by mistake, before anybody paid.
+  const oops = await chargeService.raise({
+    headId: examHead._id, title: 'Wrong amount', amount: 999, scope: 'SCHOOL',
+  }, admin._id);
+  const owedBefore = (await Student.findById(late._id).select('chargeOutstanding').lean()).chargeOutstanding;
+  ok('The mistake landed', owedBefore === 999);
+
+  const undone = await chargeService.cancel(oops.charge._id, 'wrong amount entered', admin._id);
+  ok('Cancelling withdraws every demand', undone.withdrawn === oops.raisedFor, `${undone.withdrawn} withdrawn`);
+  ok('...and every balance comes back down',
+     (await Student.findById(late._id).select('chargeOutstanding').lean()).chargeOutstanding === 0);
+  ok('The charge itself is kept, with a reason',
+     (await Charge.findById(oops.charge._id).lean()).cancelReason === 'wrong amount entered');
+
+  // ---------- siblings ----------
+  //
+  // Siblinghood is an equivalence relation, and these assertions are the whole
+  // reason it is stored as a group id instead of a list of links: the third
+  // relationship must appear WITHOUT anybody recording it, two families must be
+  // able to merge, and a family must never be left with one member in it.
+  section('Siblings');
+
+  const sibA = await studentService.create({ name: 'Aarav Gupta', phone: '9811111111', class: cls._id, admissionDate: new Date('2026-04-01') }, admin._id);
+  const sibB = await studentService.create({ name: 'Diya Gupta', phone: '9811111111', class: cls._id, admissionDate: new Date('2026-04-01') }, admin._id);
+  const sibC = await studentService.create({ name: 'Kabir Gupta', phone: '9811111111', class: cls2._id, admissionDate: new Date('2026-04-01') }, admin._id);
+  const sibD = await studentService.create({ name: 'Meera Gupta', phone: '9822222222', class: cls2._id, admissionDate: new Date('2026-04-01') }, admin._id);
+
+  const siblingsOf = async (id) => (await studentService.getLedger(id)).siblings;
+
+  let selfLink = false;
+  try { await studentService.linkSibling(sibA._id, sibA._id); } catch { selfLink = true; }
+  ok('A student cannot be their own sibling', selfLink);
+
+  const l1 = await studentService.linkSibling(sibA._id, sibB._id);
+  ok('Two students link into a new family', l1.members.length === 2 && l1.merged === false);
+
+  ok('The link works from the other side too', (await siblingsOf(sibB._id)).some((s) => s.name === 'Aarav Gupta'));
+
+  let dupe = false;
+  try { await studentService.linkSibling(sibA._id, sibB._id); } catch (e) { dupe = e.code === 'ALREADY_SIBLINGS'; }
+  ok('Linking the same pair twice is refused', dupe);
+
+  // The transitive case: C joins B, and A — who nobody mentioned — gains a
+  // sibling. This is the one a list-of-pairs model gets wrong.
+  await studentService.linkSibling(sibB._id, sibC._id);
+  const aFamily = await siblingsOf(sibA._id);
+  ok('A third child joins the whole family at once', aFamily.length === 2,
+     aFamily.map((s) => s.name).join(', '));
+  ok('...including the sibling nobody linked directly', aFamily.some((s) => s.name === 'Kabir Gupta'));
+
+  // Two separate families merging.
+  const other1 = await studentService.create({ name: 'Ishaan Rao', phone: '9833333333', class: cls._id, admissionDate: new Date('2026-04-01') }, admin._id);
+  await studentService.linkSibling(sibD._id, other1._id);
+  ok('A second, separate family exists', (await siblingsOf(sibD._id)).length === 1);
+
+  const merge = await studentService.linkSibling(sibA._id, sibD._id);
+  ok('Linking across two families merges them', merge.merged === true && merge.members.length === 5,
+     `${merge.members.length} members`);
+  ok('Everybody ends up in one family', (await siblingsOf(other1._id)).length === 4);
+
+  // Unlinking one person leaves the rest together.
+  await studentService.unlinkSibling(sibA._id, other1._id);
+  ok('An unlinked child leaves the family', (await siblingsOf(other1._id)).length === 0);
+  ok('The rest stay together', (await siblingsOf(sibA._id)).length === 3);
+
+  let notSiblings = false;
+  try { await studentService.unlinkSibling(sibA._id, other1._id); } catch (e) { notSiblings = e.code === 'NOT_SIBLINGS'; }
+  ok('Unlinking somebody who is not linked is refused', notSiblings);
+
+  // Down to two, then one: the group has to dissolve rather than leave a
+  // single student flagged as being in a family.
+  await studentService.unlinkSibling(sibA._id, sibC._id);
+  await studentService.unlinkSibling(sibA._id, sibD._id);
+  const pair = await siblingsOf(sibA._id);
+  ok('Two are left', pair.length === 1, pair.map((s) => s.name).join(', '));
+
+  const last = await studentService.unlinkSibling(sibA._id, sibB._id);
+  ok('Removing the second of two dissolves the family', last.remaining === 0);
+  ok('Neither of them is left in a group', (await siblingsOf(sibA._id)).length === 0 && (await siblingsOf(sibB._id)).length === 0);
+
+  const orphan = await Student.findById(sibA._id).select('siblingGroup').lean();
+  ok('The group id is cleared, not left dangling', orphan.siblingGroup === null, String(orphan.siblingGroup));
 
   // ---------- reports ----------
   section('Reports');
@@ -291,7 +571,7 @@ const section = (t) => console.log(`\n== ${t}`);
   const summary = await feeService.summary({ month: '2026-08' });
   ok('Class-wise summary built', summary.classes.length === 2, `${summary.classes.length} classes`);
 
-  const db2 = await reportService.daybook(new Date());
+  const db2 = await reportService.daybook({ from: new Date(), to: new Date() });
   ok('Day book ran', typeof db2.totals.net === 'number');
 
   console.log(`\n${'='.repeat(50)}`);

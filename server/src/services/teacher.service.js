@@ -39,6 +39,12 @@ const update = async (id, updates) => {
     if (!teacher) throw new ApiError(404, 'Teacher not found');
 
     Object.assign(teacher, updates);
+
+    // Bringing somebody back has to clear the date they left, or the record
+    // reads Active with a leaving date sitting beside it.
+    if (updates.status === 'Active') teacher.leftAt = null;
+    if (updates.status === 'Left' && !teacher.leftAt) teacher.leftAt = new Date();
+
     await teacher.save();
     return teacher;
 };

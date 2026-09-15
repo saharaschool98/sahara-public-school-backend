@@ -58,6 +58,23 @@ const applyDiscount = asyncHandler(async (req, res) => {
     return res.status(200).json(new ApiResponse(200, data, 'Discount applied'));
 });
 
+// Money going out of the drawer, so it is audited like a void rather than like
+// a collection — who returned it, how much, and why.
+const refundCredit = asyncHandler(async (req, res) => {
+    const actor = { id: req.userId, name: req.user.name, role: req.role };
+    const data = await feeService.refundCredit(req.params.studentId, req.body, actor);
+
+    audit.log({
+        ...audit.fromRequest(req),
+        action: 'fee.refund',
+        entity: 'Transaction',
+        entityId: data.transactionId,
+        summary: `₹${data.amount} advance returned to ${data.name} (${data.mode}): ${req.body.reason}`,
+    });
+
+    return res.status(200).json(new ApiResponse(200, data, 'Advance returned'));
+});
+
 const voidReceipt = asyncHandler(async (req, res) => {
     const actor = { id: req.userId, name: req.user.name, role: req.role };
     const data = await feeService.voidReceipt(req.params.id, req.body.reason, actor);
@@ -90,6 +107,7 @@ module.exports = {
     collect,
     applyDiscount,
     voidReceipt,
+    refundCredit,
     getReceipt,
     summary,
 };

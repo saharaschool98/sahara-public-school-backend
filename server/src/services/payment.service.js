@@ -1,6 +1,15 @@
 const Transaction = require('../models/transaction.model');
 const ApiError = require('../utils/ApiError');
 const sessionService = require('./session.service');
+const ledger = require('./ledger.service');
+// The four modules that own money a student hands over at the counter. None of
+// them reaches back to this file, so there is no cycle — this is the screen
+// that looks at all four, not a thing any of them needs to know about.
+const feeService = require('./fee.service');
+const chargeService = require('./charge.service');
+const saleService = require('./sale.service');
+const studentService = require('./student.service');
+const withTransaction = require('../utils/withTransaction');
 const { getPaginationParams, fetchPage } = require('../utils/paginate');
 const { round2 } = require('../utils/money');
 const { startOfDayIST, endOfDayIST } = require('../utils/istDate');
@@ -22,6 +31,11 @@ const { startOfDayIST, endOfDayIST } = require('../utils/istDate');
 // No balance, no rollup, no fee demand, no ledger row. If ticking a box could
 // move a number, it would be a second and much quieter way to edit the books,
 // and the whole append-only design would be for nothing.
+//
+// The flag also decides how long an entry stays correctable. Unverified, the
+// office can still fix what it wrote down; verified, the row is sealed against
+// both editing and voiding. See `update` below, and transaction.model.js for
+// the seal itself.
 // ---------------------------------------------------------------------------
 
 const { VERIFIABLE_FILTER } = Transaction;
@@ -163,4 +177,170 @@ const setVerified = async (id, verified, actor) => {
     return { payment: updated, changed: true };
 };
 
-module.exports = { listForDate, setVerified, oldestPending, LIST_FIELDS };
+// ---------------------------------------------------------------------------
+// CORRECTING AN ENTRY THAT HAS NOT BEEN CHECKED YET
+//
+// While a payment is unverified the office can still fix what it wrote down.
+// Once it has been signed off against the cash box it is sealed — see
+// transaction.model.js for why the two states exist.
+//
+// Three things can be corrected, and they are not the same kind of change:
+//
+//   mode — the one the reconciliation itself turns up. "Cash" was written and
+//          the money arrived by UPI: the drawer is short by exactly that and
+//          the app is over by it, and until the row is corrected neither will
+//          tally. Moves no money.
+//
+//   note — the cheque number, the UPI reference, who handed the money over.
+//          Moves no money either.
+//
+//   amount — this one DOES move money, and every record behind it has to move
+//          with it: the months a fee receipt paid, the charges an other-fee
+//          receipt cleared, the credit half of a stock bill, the figure a card
+//          was issued for, the student's balance, and the month's rollup. It
+//          is the reason the second half of this file exists.
+//
+// What still cannot be corrected is WHO paid and WHAT FOR. A receipt written
+// against the wrong student, or a stock bill with the wrong items on it, is not
+// a mistyped figure — it is the wrong document, and the way to fix a wrong
+// document is to void it and write the right one.
+//
+// A reprint matters after an amount change. The slip in the parent's hand is
+// now wrong, and the correction is only possible in the short window before
+// anybody has reconciled the day, so handing over a fresh one is realistic.
+// ---------------------------------------------------------------------------
+
+// Which module owns the money behind each kind of counter slip.
+//
+// An amount is not a number sitting on a ledger row. It is what a fee demand
+// shows as paid, what a bill shows as still owed, what a card was issued for.
+// Only the module that wrote those can move them back, so this dispatches
+// instead of reaching into four collections from here — the same reason
+// nothing outside ledger.service writes a transaction.
+//
+// Every one of them is handed the mongoose session and returns the fields the
+// ledger row should now carry.
+const MONEY_OWNER = {
+    FEE: (txn, amount, s) => feeService.reviseReceipt(txn, amount, s),
+    CHARGE: (txn, amount, s) => chargeService.reviseReceipt(txn, amount, s),
+    STOCK_SALE: (txn, amount, s) => saleService.revisePayment(txn, amount, s),
+    ID_CARD: (txn, amount, s) => studentService.reviseIdCardAmount(txn, amount, s),
+};
+
+const update = async (id, changes, actor) => {
+    // The whole document, not the list projection: an amount correction needs
+    // the allocation this receipt recorded, and which document it points at.
+    const txn = await Transaction.findById(id).lean();
+    if (!txn) throw new ApiError(404, 'Payment not found');
+
+    // The same test the tick uses. An expense or a salary is not somebody's
+    // counter slip to correct, and a voided row has nothing left to correct.
+    if (!Transaction.isVerifiable(txn)) {
+        throw new ApiError(
+            400,
+            txn.voided
+                ? 'This entry has been voided — write a fresh one instead of correcting it'
+                : 'Only money collected from a student can be corrected here'
+        ).withCode('NOT_VERIFIABLE');
+    }
+
+    if (Transaction.isSealed(txn)) {
+        throw new ApiError(409, Transaction.SEALED_MESSAGE).withCode('PAYMENT_VERIFIED');
+    }
+
+    const set = {};
+    if (changes.mode !== undefined) set.mode = changes.mode;
+    if (changes.note !== undefined) set.note = changes.note;
+
+    // The dialog sends every field it shows, so an amount that came back
+    // unchanged is not a change — only a different figure is.
+    const asked = changes.amount === undefined ? null : round2(changes.amount);
+    const movesMoney = asked !== null && asked !== round2(txn.amount);
+
+    if (!Object.keys(set).length && !movesMoney) throw new ApiError(400, 'Nothing to change');
+
+    // A mode correction moves no balance and no total, but it DOES move the
+    // money between drawers — ₹5,000 counted in the cash box that actually
+    // arrived by UPI. The cash book is maintained per mode, so this is not free
+    // any more, and it has to be atomic with the row's own update or the two
+    // disagree permanently.
+    const modeMoved = set.mode !== undefined && set.mode !== txn.mode;
+
+    // ---- the cheap path: nothing here touches a balance, a rollup or a mode ----
+    if (!movesMoney && !modeMoved) {
+        // Conditional on STILL being unverified, so an edit cannot land in the
+        // same second somebody signs the row off — otherwise the person
+        // reconciling would tick a figure and it would change underneath them.
+        const updated = await Transaction.findOneAndUpdate(
+            { _id: id, ...PENDING, voided: { $ne: true } },
+            { $set: set },
+            { new: true }
+        )
+            .select(LIST_FIELDS)
+            .lean();
+
+        if (!updated) {
+            throw new ApiError(409, Transaction.SEALED_MESSAGE).withCode('PAYMENT_VERIFIED');
+        }
+
+        return { before: txn, payment: updated };
+    }
+
+    // ---- the mode path: the row and its drawer, together or not at all ----
+    if (!movesMoney) {
+        await withTransaction(async (mongoSession) => {
+            // Guarded on the mode that was READ, not just on the row being
+            // unverified. Two people moving the same receipt between drawers in
+            // the same second would otherwise each take it off a bucket it was
+            // no longer in, and the cash book would end up short by one of them.
+            const moved = await Transaction.findOneAndUpdate(
+                { _id: id, mode: txn.mode, ...PENDING, voided: { $ne: true } },
+                { $set: set },
+                { new: true, session: mongoSession }
+            ).lean();
+
+            if (!moved) {
+                throw new ApiError(
+                    409,
+                    'This payment changed while it was being corrected — open it again and check it'
+                ).withCode('STALE_PAYMENT');
+            }
+
+            return ledger.moveMode({ original: txn, mode: set.mode }, mongoSession);
+        });
+
+        const payment = await Transaction.findById(id).select(LIST_FIELDS).lean();
+        return { before: txn, payment };
+    }
+
+    // ---- the money path ----
+    const revise = MONEY_OWNER[txn.type];
+    if (!revise) {
+        throw new ApiError(
+            400,
+            'The amount on this entry cannot be corrected — void it and enter it again'
+        ).withCode('AMOUNT_LOCKED');
+    }
+
+    await withTransaction(async (mongoSession) => {
+        // The owning module moves its own records first and says what the row
+        // should now record as covered. If it refuses — more than the student
+        // owes, a bill that has since taken money — nothing below runs and
+        // nothing above it commits.
+        const { set: owned = {} } = await revise(txn, asked, mongoSession);
+
+        // The row and the rollups together, last, in the same session.
+        return ledger.reviseAmount(
+            { original: txn, amount: asked, set: { ...set, ...owned } },
+            mongoSession
+        );
+    });
+
+    // Read back through the list projection, so a correction that moved money
+    // answers with exactly the same shape as one that did not.
+    const payment = await Transaction.findById(id).select(LIST_FIELDS).lean();
+
+    return { before: txn, payment };
+};
+
+module.exports = { listForDate, setVerified, update, oldestPending, LIST_FIELDS };

@@ -5,15 +5,14 @@ const mongoose = require('mongoose');
 // user documents.
 const teacherSchema = new mongoose.Schema(
     {
-        employeeCode: { type: String, required: true }, // EMP0012 - counter se
+        employeeCode: { type: String, required: true }, // EMP0012, from the counter
         name: { type: String, required: true, trim: true },
         nameLower: { type: String, required: true, lowercase: true, trim: true },
         phone: { type: String, default: '', trim: true },
         designation: { type: String, default: '', trim: true },
 
-        // This value is SNAPSHOT onto the slip when it is generated,
-        // onto the slip, so a raise given in June does not rewrite April's paid
-        // slip.
+        // This value is SNAPSHOT onto the slip when it is generated, so a raise
+        // given in June does not rewrite April's paid slip.
         monthlySalary: { type: Number, required: true, min: 0 },
 
         // How many late arrivals a month are forgiven. Lates inside this cost

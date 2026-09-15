@@ -6,6 +6,7 @@ const ledger = require('./ledger.service');
 const sessionService = require('./session.service');
 const withTransaction = require('../utils/withTransaction');
 const { round2 } = require('../utils/money');
+const { isDuplicateKey } = require('../utils/mongoErrors');
 const {
     isValidMonthKey,
     isSundayIST,
@@ -251,7 +252,16 @@ const generate = async ({ month }, actorId) => {
         try {
             created = await SalarySlip.insertMany(docs, { ordered: false });
         } catch (err) {
-            if (err.code !== 11000 && err.code !== undefined) throw err;
+            // ONLY a duplicate key is a result here — somebody else generated the
+            // same month in the gap above, and the unique index on
+            // { teacher, month } refused the second row. That is the design
+            // working.
+            //
+            // This used to read `err.code !== 11000 && err.code !== undefined`,
+            // and a mongoose ValidationError carries no `code` at all — so every
+            // validation failure, and every plain TypeError, was swallowed and
+            // reported back to the office as a cheerful "0 slips created".
+            if (!isDuplicateKey(err)) throw err;
             created = err.insertedDocs || [];
         }
     }
@@ -443,22 +453,55 @@ const pay = async (id, { amount, mode, date, note = '' }, actorId) => {
     const session = await sessionService.getActiveSessionName();
 
     return withTransaction(async (mongoSession) => {
-        const paidAmount = round2(slip.paidAmount + value);
         const payDate = date || new Date();
 
-        await SalarySlip.updateOne(
-            { _id: id },
+        // ---------------------------------------------------------------------
+        // The new total is computed BY THE DATABASE, from the row's own current
+        // value, under a filter that refuses to overpay.
+        //
+        // This used to read the slip outside the transaction and then write an
+        // absolute `$set: { paidAmount: slip.paidAmount + value }`. Two partial
+        // payments started in the same second both read paidAmount 0, both wrote
+        // their own value, and the slip ended up recording one of them — while
+        // the cash book correctly recorded two rows going out. The books
+        // disagreed, and nothing on any screen said so.
+        //
+        // A pipeline update runs its stages in order, so the second $set sees the
+        // paidAmount the first one just wrote — status and paidAt therefore
+        // follow the real total, not the stale one.
+        // ---------------------------------------------------------------------
+        const updated = await SalarySlip.findOneAndUpdate(
             {
-                $set: {
-                    paidAmount,
-                    // Status becomes Paid only when fully paid — on a partial payment
-                    // the slip stays Approved so it keeps showing on the pending list.
-                    status: paidAmount >= slip.netPayable ? 'Paid' : 'Approved',
-                    ...(paidAmount >= slip.netPayable && { paidAt: payDate }),
-                },
+                _id: id,
+                status: { $in: ['Approved', 'Paid'] },
+                // Never more than the slip promises, whatever else is in flight.
+                $expr: { $lte: [{ $add: ['$paidAmount', value] }, '$netPayable'] },
             },
-            { session: mongoSession }
+            [
+                { $set: { paidAmount: { $round: [{ $add: ['$paidAmount', value] }, 2] } } },
+                {
+                    $set: {
+                        // Paid only when fully paid — on a partial payment the slip
+                        // stays Approved so it keeps showing on the pending list.
+                        status: { $cond: [{ $gte: ['$paidAmount', '$netPayable'] }, 'Paid', 'Approved'] },
+                        paidAt: { $cond: [{ $gte: ['$paidAmount', '$netPayable'] }, payDate, '$paidAt'] },
+                    },
+                },
+            ],
+            { new: true, session: mongoSession }
         );
+
+        // The guard refused. Somebody paid this slip between the read above and
+        // this write, so the ledger row must not be written either — and the
+        // transaction rolls back whatever else was in flight.
+        if (!updated) {
+            throw new ApiError(
+                409,
+                'This slip was paid from somewhere else a moment ago — reopen it to see what is left'
+            ).withCode('SLIP_ALREADY_PAID');
+        }
+
+        const paidAmount = round2(updated.paidAmount);
 
         await ledger.record(
             {
@@ -477,7 +520,12 @@ const pay = async (id, { amount, mode, date, note = '' }, actorId) => {
             mongoSession
         );
 
-        return { slipId: id, paid: value, totalPaid: paidAmount, remaining: round2(slip.netPayable - paidAmount) };
+        return {
+            slipId: id,
+            paid: value,
+            totalPaid: paidAmount,
+            remaining: round2(updated.netPayable - paidAmount),
+        };
     });
 };
 

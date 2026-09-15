@@ -12,8 +12,13 @@ const { assertOwnedPublicId, destroyImage } = require('../config/cloudinary');
 
 // ---- categories ----
 
-const listCategories = () =>
-    ExpenseCategory.find({ isActive: true }).sort({ nameLower: 1 }).lean();
+// The picker wants only the live heads; the management list has to show the
+// retired ones too, or retiring one would hide it forever and there would be no
+// way back.
+const listCategories = ({ includeInactive } = {}) =>
+    ExpenseCategory.find(includeInactive === 'true' || includeInactive === true ? {} : { isActive: true })
+        .sort({ nameLower: 1 })
+        .lean();
 
 const createCategory = async (payload, actorId) => {
     const nameLower = payload.name.toLowerCase().trim();
@@ -23,9 +28,33 @@ const createCategory = async (payload, actorId) => {
     return ExpenseCategory.create({ ...payload, nameLower, createdBy: actorId });
 };
 
+// A rename has to move nameLower with it — that field carries the unique index
+// and the sort order, and findByIdAndUpdate does not run the pre('validate')
+// hook that normally keeps the two in step. Left alone, a renamed head sorted
+// under its old name and its old name stayed reserved.
+//
+// Renaming does NOT touch the expenses already filed under this head: each one
+// stored `categoryName` as a copy at the moment it was recorded, so last year's
+// register keeps the name it was actually filed under.
 const updateCategory = async (id, updates) => {
-    const doc = await ExpenseCategory.findByIdAndUpdate(id, { $set: updates }, { new: true });
+    const doc = await ExpenseCategory.findById(id);
     if (!doc) throw new ApiError(404, 'Category not found');
+
+    if (updates.name !== undefined) {
+        const nameLower = updates.name.toLowerCase().trim();
+
+        if (nameLower !== doc.nameLower) {
+            const clash = await ExpenseCategory.findOne({ nameLower, _id: { $ne: doc._id } }).lean();
+            if (clash) throw new ApiError(409, 'A category with this name already exists');
+        }
+
+        doc.name = updates.name;
+        doc.nameLower = nameLower;
+    }
+
+    if (updates.isActive !== undefined) doc.isActive = updates.isActive;
+
+    await doc.save();
     return doc;
 };
 
@@ -135,8 +164,29 @@ const update = async (id, updates) => {
         for (const a of updates.attachments) assertOwnedPublicId(a.publicId);
     }
 
+    const before = (expense.attachments || []).map((a) => a.publicId);
+
     Object.assign(expense, updates);
     await expense.save();
+
+    // The ledger row keeps its OWN copy of the attachments — that is what the day
+    // book renders. Editing the expense used to leave that copy behind, so the
+    // photo on the day book stayed the one that was replaced.
+    if (updates.attachments) {
+        await Transaction.updateOne(
+            { refModel: 'Expense', refId: expense._id, voided: false },
+            { $set: { attachments: expense.attachments } }
+        );
+
+        // Photos that are no longer referenced by anything. Best-effort, after the
+        // save — a failure leaves an orphan file, which beats failing an edit that
+        // has already been accepted.
+        const kept = new Set((expense.attachments || []).map((a) => a.publicId));
+        for (const publicId of before) {
+            if (!kept.has(publicId)) destroyImage(publicId).catch(() => {});
+        }
+    }
+
     return expense;
 };
 

@@ -10,7 +10,6 @@ const loginSchema = z.object({
 // Minimum 8 characters. Stricter rules (uppercase + symbol + number) are
 // deliberately not imposed — they push people towards predictable patterns
 // like "Password@123" and onto sticky notes. Length is the real strength.
-// 
 const passwordField = z
     .string()
     .min(8, 'Password must be at least 8 characters')
@@ -45,7 +44,6 @@ const updateUserSchema = z
     .refine((d) => Object.keys(d).length > 0, 'Provide at least one field to update');
 
 // Permission update — unknown keys stop here and never reach the service.
-// 
 const updatePermissionsSchema = z.object({
     permissions: z
         .array(z.string())

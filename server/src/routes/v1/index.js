@@ -1,6 +1,7 @@
 const router = require('express').Router();
 
 const { isAuth, requirePasswordChanged } = require('../../middlewares/isAuth');
+const readOnly = require('../../middlewares/readOnly');
 
 // Auth is open — login and refresh happen here
 router.use('/auth', require('./auth.routes'));
@@ -19,6 +20,16 @@ router.use(isAuth);
 // under /auth, before this gate).
 router.use(requirePasswordChanged);
 
+// ---------------------------------------------------------------------------
+// A read-only role (Watcher) stops here on anything that is not a GET.
+//
+// It sits ABOVE every module for the same reason isAuth does: one place, and a
+// route file added tomorrow is covered without anybody remembering to do it.
+// It is deliberately below /auth, so a Watcher can still sign in, sign out and
+// change their own password — all of which are POSTs.
+// ---------------------------------------------------------------------------
+router.use(readOnly);
+
 router.use('/users', require('./user.routes'));
 router.use('/permissions', require('./permission.routes'));
 router.use('/sessions', require('./session.routes'));
@@ -26,6 +37,8 @@ router.use('/classes', require('./class.routes'));
 router.use('/students', require('./student.routes'));
 router.use('/leads', require('./lead.routes'));
 router.use('/fees', require('./fee.routes'));
+// Admission, exams, trips — everything charged beyond the monthly fee.
+router.use('/charges', require('./charge.routes'));
 router.use('/stock', require('./stock.routes'));
 router.use('/sales', require('./sale.routes'));
 router.use('/vendors', require('./vendor.routes'));

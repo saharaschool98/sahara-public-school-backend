@@ -24,12 +24,24 @@ const teacherAttendanceSchema = new mongoose.Schema(
         },
         note: { type: String, default: '' },
         markedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+        // When this day was sealed. A row is written once and never updated, so
+        // this is the moment the mark became final.
         markedAt: { type: Date, default: Date.now },
     },
     { timestamps: true }
 );
 
-// Upsert on re-mark — a second row for one day can never appear
+// ---------------------------------------------------------------------------
+// One teacher, one day, one row — written ONCE.
+//
+// This index is what makes the lock real. The service writes with
+// `$setOnInsert`, so an existing row receives nothing; the index guarantees
+// the same thing even against two people saving the same sheet in the same
+// second. Attendance feeds payroll, and a register that can be rewritten after
+// a slip was built is not a register.
+//
+// There is deliberately no route that updates or deletes one of these rows.
+// ---------------------------------------------------------------------------
 teacherAttendanceSchema.index({ teacher: 1, date: 1 }, { unique: true });
 // "Show today's sheet"
 teacherAttendanceSchema.index({ session: 1, date: 1 });

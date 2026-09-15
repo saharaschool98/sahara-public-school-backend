@@ -12,8 +12,10 @@ const rolePermissionSchema = new mongoose.Schema(
             required: true,
         },
         permissions: { type: [String], default: [] },
-        // Bumped on every save. The cache can compare it to tell whether it holds
-        // a stale copy, without reading the whole document.
+        // Bumped on every save. Nothing reads it to decide freshness — the cache
+        // is invalidated outright the moment an Admin saves — so this is purely a
+        // record of how many times this role's grants have been rewritten, which
+        // is a question the edit history gets asked.
         version: { type: Number, default: 1 },
         updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     },

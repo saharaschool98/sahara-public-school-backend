@@ -4,7 +4,6 @@ const ApiError = require('../utils/ApiError');
 // Only these folders are allowed. What the client sends becomes part of
 // the signature, so it must be validated — otherwise any authenticated
 // user could upload anywhere in our Cloudinary account.
-// 
 const FOLDERS = new Set(['bills', 'expenses', 'students', 'teachers', 'items', 'misc']);
 
 const getSignature = (folder = 'misc') => {

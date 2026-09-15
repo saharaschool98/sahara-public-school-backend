@@ -21,6 +21,7 @@ const mongoose = require('mongoose');
 const Student = require('../server/src/models/student.model');
 const FeeDemand = require('../server/src/models/feeDemand.model');
 const StockSale = require('../server/src/models/stockSale.model');
+const ChargeDemand = require('../server/src/models/chargeDemand.model');
 const Vendor = require('../server/src/models/vendor.model');
 const Purchase = require('../server/src/models/purchase.model');
 const StockItem = require('../server/src/models/stockItem.model');
@@ -28,7 +29,7 @@ const StockMovement = require('../server/src/models/stockMovement.model');
 const Transaction = require('../server/src/models/transaction.model');
 const MonthlyRollup = require('../server/src/models/monthlyRollup.model');
 const AcademicSession = require('../server/src/models/academicSession.model');
-const { ROLLUP_MAP } = require('../server/src/services/ledger.service');
+const { ROLLUP_MAP, MODES } = require('../server/src/services/ledger.service');
 
 const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 const FIX = process.argv.includes('--fix');
@@ -44,10 +45,12 @@ const report = (label, id, stored, actual) => {
 
 // ---- students ----
 const checkStudents = async (session) => {
-    console.log('\nStudents (feeOutstanding, stockOutstanding)');
+    console.log('\nStudents (feeOutstanding, stockOutstanding, chargeOutstanding, creditBalance)');
 
-    const [students, demands, sales] = await Promise.all([
-        Student.find({ session }).select('name feeOutstanding stockOutstanding').lean(),
+    const [students, demands, sales, charges, advances, spentCredit, refunds] = await Promise.all([
+        Student.find({ session })
+            .select('name feeOutstanding stockOutstanding chargeOutstanding creditBalance openingCredit')
+            .lean(),
         FeeDemand.aggregate([
             { $match: { session } },
             {
@@ -61,10 +64,46 @@ const checkStudents = async (session) => {
             { $match: { session, voided: false, student: { $ne: null } } },
             { $group: { _id: '$student', due: { $sum: '$dueAmount' } } },
         ]),
+        // Admission, exams, trips — the same shape as the fee demands above.
+        ChargeDemand.aggregate([
+            { $match: { session } },
+            {
+                $group: {
+                    _id: '$student',
+                    due: { $sum: { $subtract: ['$amount', { $add: ['$discount', '$paidAmount'] }] } },
+                },
+            },
+        ]),
+
+        // ---- the three halves of an advance balance ----
+        //
+        // Credit cannot be read off the demands the way an outstanding can, so
+        // it is rebuilt from where it came from and where it went: fee money no
+        // month claimed, less what later months have since eaten, less what was
+        // handed back. A voided receipt is out of the first sum and its share
+        // is already out of the second, so the two stay in step.
+        Transaction.aggregate([
+            { $match: { session, type: 'FEE', voided: { $ne: true }, advance: { $gt: 0 } } },
+            { $group: { _id: '$party.ref', total: { $sum: '$advance' } } },
+        ]),
+        FeeDemand.aggregate([
+            { $match: { session, paidFromCredit: { $gt: 0 } } },
+            { $group: { _id: '$student', total: { $sum: '$paidFromCredit' } } },
+        ]),
+        Transaction.aggregate([
+            { $match: { session, type: 'FEE_REFUND', voided: { $ne: true } } },
+            { $group: { _id: '$party.ref', total: { $sum: '$amount' } } },
+        ]),
     ]);
 
     const feeMap = new Map(demands.map((d) => [d._id.toString(), Math.max(0, d.due)]));
     const stockMap = new Map(sales.map((s) => [s._id.toString(), s.due]));
+    const chargeMap = new Map(charges.map((c) => [c._id.toString(), Math.max(0, c.due)]));
+
+    const sumMap = (rows) => new Map(rows.filter((r) => r._id).map((r) => [r._id.toString(), r.total]));
+    const paidAhead = sumMap(advances);
+    const usedAhead = sumMap(spentCredit);
+    const givenBack = sumMap(refunds);
 
     const ops = [];
 
@@ -73,14 +112,33 @@ const checkStudents = async (session) => {
         const fee = round2(feeMap.get(key) || 0);
         const stock = round2(stockMap.get(key) || 0);
 
+        const charge = round2(chargeMap.get(key) || 0);
+        // openingCredit is where the counting STARTS, not something derived —
+        // an advance carried in from last session has none of the three source
+        // rows below behind it, and without this term the rebuild would call it
+        // drift and `--fix` would wipe money the school owes a parent.
+        const credit = round2(
+            (s.openingCredit || 0)
+            + (paidAhead.get(key) || 0) - (usedAhead.get(key) || 0) - (givenBack.get(key) || 0)
+        );
+
         const feeDrift = report('student.fee', s.name, s.feeOutstanding, fee);
         const stockDrift = report('student.stock', s.name, s.stockOutstanding, stock);
+        const chargeDrift = report('student.charges', s.name, s.chargeOutstanding || 0, charge);
+        const creditDrift = report('student.credit', s.name, s.creditBalance || 0, credit);
 
-        if ((feeDrift || stockDrift) && FIX) {
+        if ((feeDrift || stockDrift || chargeDrift || creditDrift) && FIX) {
             ops.push({
                 updateOne: {
                     filter: { _id: s._id },
-                    update: { $set: { feeOutstanding: fee, stockOutstanding: stock } },
+                    update: {
+                        $set: {
+                            feeOutstanding: fee,
+                            stockOutstanding: stock,
+                            chargeOutstanding: charge,
+                            creditBalance: credit,
+                        },
+                    },
                 },
             });
         }
@@ -173,7 +231,7 @@ const checkRollups = async (session) => {
     console.log('\nMonthly rollups');
 
     const [txns, demands, purchases] = await Promise.all([
-        Transaction.find({ session }).select('type month amount class className voided reversalOf').lean(),
+        Transaction.find({ session }).select('type direction mode month amount class className voided reversalOf').lean(),
         FeeDemand.aggregate([
             { $match: { session } },
             {
@@ -217,26 +275,81 @@ const checkRollups = async (session) => {
         }
     };
 
+    // The split by payment mode lives at SCHOOL scope only — a class does not
+    // have a cash box. ledger.bumpRollup keeps it out of the class documents,
+    // and rebuilding it into them here would invent drift that is not there.
+    const bumpSchool = (month, field, amount) => {
+        const key = `${month}|SCHOOL|null`;
+        if (!buckets.has(key)) buckets.set(key, { month, scope: 'SCHOOL', class: null, className: '' });
+        const b = buckets.get(key);
+        b[field] = round2((b[field] || 0) + amount);
+    };
+
     for (const t of txns) {
         // Voided rows are NOT skipped. When they were written they raised the
         // rollup, and their REVERSAL row lowered it again. Counting both is what
         // actually reproduces the live state.
         let effectiveType = t.type;
         let sign = 1;
+        // -------------------------------------------------------------------
+        // A reversal is booked against the ORIGINAL's month, never its own.
+        //
+        // ledger.reverse says so explicitly — "from the ORIGINAL's month, not
+        // today's, otherwise a July mistake would understate August" — but the
+        // REVERSAL ROW ITSELF stores today's month, and this loop was reading
+        // that. So a July receipt voided in August rebuilt as a deduction from
+        // AUGUST while the live rollup had correctly taken it off July: two
+        // months reported as drifting when nothing had drifted, and `--fix`
+        // would then have written that wrong answer into both of them.
+        //
+        // It never showed up because a void in the same month as its receipt —
+        // which is every void a test makes, and most of the real ones — lands
+        // on the same bucket either way.
+        // -------------------------------------------------------------------
+        let month = t.month;
+        let classId = t.class;
+        let className = t.className;
+        let direction = t.direction;
+        let mode = t.mode;
 
         if (t.type === 'REVERSAL') {
             const original = t.reversalOf && byId.get(t.reversalOf.toString());
             if (!original) continue;
             effectiveType = original.type;
             sign = -1;
+            month = original.month;
+            classId = original.class;
+            className = original.className;
+            // The reversal carries the opposite direction so the day book reads
+            // correctly on both sides — but what it UNDOES is a movement
+            // through the original's own drawer, so that is the bucket it comes
+            // off. Same as ledger.reverse.
+            direction = original.direction;
+            mode = original.mode;
         }
 
         const mapping = ROLLUP_MAP[effectiveType];
         if (!mapping) continue;
 
-        const [head, cash] = mapping;
-        if (head) bump(t.month, t.class, t.className, head, sign * t.amount);
-        if (cash) bump(t.month, t.class, t.className, cash, sign * t.amount);
+        // `headSign` is the third slot in a mapping and is -1 for exactly one
+        // type: a fee refund, whose cash goes OUT while the fee collection it
+        // came from goes DOWN. Reading only the first two entries here rebuilt
+        // a refund as if it had added to collection, and every school that ever
+        // handed an advance back would have shown drift it did not have.
+        //
+        // The fourth slot is a second head that moves WITH the cash — today
+        // only `feeRefunds`, so that money handed back is a number of its own
+        // instead of a hole inside feeCollected.
+        const [head, cash, headSign = 1, alsoHead = null] = mapping;
+        if (head) bump(month, classId, className, head, sign * headSign * t.amount);
+        if (cash) bump(month, classId, className, cash, sign * t.amount);
+        if (alsoHead) bump(month, classId, className, alsoHead, sign * t.amount);
+
+        // Which drawer it moved through.
+        if (mode) {
+            const bucket = direction === 'IN' ? 'inByMode' : 'outByMode';
+            bumpSchool(month, `${bucket}.${mode}`, sign * t.amount);
+        }
     }
 
     for (const d of demands) {
@@ -265,10 +378,24 @@ const checkRollups = async (session) => {
     // at all.
     const FIELDS = [
         'feeExpected', 'feeCollected', 'feeDiscount',
-        'stockSales', 'idCardCollected', 'otherIncome',
+        // chargeCollected was missing. Admission, exam and trip money still
+        // reached cashIn, so the totals looked right while its own head could
+        // sit wrong indefinitely — exactly the failure the comment above
+        // describes, repeated the next time a head was added.
+        'stockSales', 'idCardCollected', 'chargeCollected', 'otherIncome',
+        'feeRefunds',
         'expenses', 'salaries', 'vendorPaid', 'purchases',
         'cashIn', 'cashOut',
+        // The split by drawer. Nested on the document, flat in the rebuilt
+        // bucket — `get` below reads either.
+        ...MODES.map((m) => `inByMode.${m}`),
+        ...MODES.map((m) => `outByMode.${m}`),
     ];
+
+    // A field name may be a dotted path now, and `stored[f]` does not follow
+    // dots. The rebuilt buckets hold those paths as flat keys, so only the
+    // stored side needs walking.
+    const get = (obj, path) => path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
 
     const ops = [];
 
@@ -277,9 +404,9 @@ const checkRollups = async (session) => {
         let drifted = false;
 
         for (const f of FIELDS) {
-            if (round2(current[f] || 0) !== round2(actual[f] || 0)) {
+            if (round2(get(current, f) || 0) !== round2(actual[f] || 0)) {
                 console.log(
-                    `  DRIFT  rollup ${key} ${f}: ${round2(current[f] || 0)} -> ${round2(actual[f] || 0)}`
+                    `  DRIFT  rollup ${key} ${f}: ${round2(get(current, f) || 0)} -> ${round2(actual[f] || 0)}`
                 );
                 driftCount += 1;
                 drifted = true;

@@ -7,7 +7,6 @@ const mongoose = require('mongoose');
 // read, and a sale $incs the right size's stock atomically (via
 // arrayFilters). A separate collection would add a join on the hottest
 // read path in the stock module, buying flexibility nobody needs.
-// 
 const variantSchema = new mongoose.Schema(
     {
         label: { type: String, required: true, trim: true }, // "Size 30"

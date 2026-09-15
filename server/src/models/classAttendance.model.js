@@ -31,12 +31,14 @@ const classAttendanceSchema = new mongoose.Schema(
         absent: { type: Number, required: true, min: 0 },
 
         markedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+        // When this class's day was sealed — the row is written once, never updated.
         markedAt: { type: Date, default: Date.now },
     },
     { timestamps: true }
 );
 
-// One class, one day, one row — re-marking updates the same row
+// One class, one day, one row — written ONCE and never rewritten. The service
+// writes with `$setOnInsert`; this index enforces the same rule against a race.
 classAttendanceSchema.index({ class: 1, date: 1 }, { unique: true });
 // A whole-school view for one date
 classAttendanceSchema.index({ session: 1, date: 1 });

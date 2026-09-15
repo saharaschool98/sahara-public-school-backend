@@ -3,6 +3,7 @@ const ApiResponse = require('../utils/ApiResponse');
 const sessionService = require('../services/session.service');
 const classService = require('../services/class.service');
 const studentService = require('../services/student.service');
+const rolloverService = require('../services/rollover.service');
 const audit = require('../services/audit.service');
 // Only for the BEFORE snapshot on an edit — the write itself stays in the
 // service. See audit.service.js for why the snapshot is taken here.
@@ -66,14 +67,74 @@ const updateSession = asyncHandler(async (req, res) => {
     return res.status(200).json(new ApiResponse(200, data, 'Session updated'));
 });
 
+// ---- session rollover ----
+
+// Read-only. Nothing here changes anything — it is the answer to "what would
+// happen", which is the question somebody should be able to ask before moving
+// a whole school.
+const rolloverPlan = asyncHandler(async (req, res) => {
+    const data = await rolloverService.plan(req.params.id);
+    return res.status(200).json(new ApiResponse(200, data, 'Rollover plan'));
+});
+
+const rolloverClasses = asyncHandler(async (req, res) => {
+    const data = await rolloverService.copyClasses(req.params.id);
+
+    if (data.created) {
+        audit.log({
+            ...audit.fromRequest(req),
+            action: 'session.rollover.classes',
+            entity: 'AcademicSession',
+            entityId: req.params.id,
+            summary: `${data.created} classes copied forward`,
+        });
+    }
+
+    return res.status(200).json(new ApiResponse(200, data, data.created ? 'Classes copied' : data.message));
+});
+
+// The single largest write in the app, so the audit line carries every figure
+// somebody could be asked about later: who moved, what they owed, and what the
+// school was holding for them.
+const rolloverPromote = asyncHandler(async (req, res) => {
+    const data = await rolloverService.promote(req.params.id, req.body, { id: req.userId });
+
+    if (data.promoted) {
+        audit.log({
+            ...audit.fromRequest(req),
+            action: 'session.rollover.promote',
+            entity: 'AcademicSession',
+            entityId: req.params.id,
+            summary: `${data.promoted} students promoted from ${data.from} to ${data.to}`
+                + (data.arrears ? ` — ₹${data.arrears.total} of arrears carried for ${data.arrears.students}` : '')
+                + (data.creditCarried ? ` — ₹${data.creditCarried} of advance carried` : ''),
+            after: {
+                promoted: data.promoted,
+                arrears: data.arrears?.total || 0,
+                creditCarried: data.creditCarried,
+            },
+        });
+    }
+
+    return res.status(200).json(
+        new ApiResponse(200, data, data.promoted ? 'Students promoted' : data.message)
+    );
+});
+
 // ---- classes ----
 
 const listClasses = asyncHandler(async (req, res) => {
     const data = await classService.list(req.query);
-    // Classes change rarely — let the browser cache briefly and serve a stale
-    // copy while it refreshes in the background. Every screen's class
-    // dropdown comes from this one call.
-    res.set('Cache-Control', 'private, max-age=60, stale-while-revalidate=300');
+    // No Cache-Control here, deliberately.
+    //
+    // This list is EDITED from the same screen that reads it, and a browser's
+    // HTTP cache cannot be invalidated: react-query would refetch on a save, the
+    // browser would answer from its own 60-second copy, and the change would
+    // simply not appear until it expired. TanStack Query already caches this
+    // (staleTime), and that cache CAN be invalidated — which is the whole point.
+    // (Classes change rarely, which is what the header was for — but rarely is
+    // not never, and the one moment it matters is the moment somebody edits a
+    // class fee and the screen keeps showing the old one.)
     return res.status(200).json(new ApiResponse(200, data, 'Classes'));
 });
 
@@ -173,18 +234,119 @@ const updateStudent = asyncHandler(async (req, res) => {
     return res.status(200).json(new ApiResponse(200, data, 'Student updated'));
 });
 
+// Both directions of money get named in the summary line. "₹0 still
+// outstanding" reads as settled, and it is not settled when the school is
+// holding ₹2,000 of theirs — that is the half nobody chases, because nobody is
+// waiting for it.
+const leavingSummary = (data) =>
+    [
+        `₹${data.outstandingCarried} still outstanding`,
+        data.creditHeld > 0 ? `₹${data.creditHeld} still held in advance` : null,
+    ]
+        .filter(Boolean)
+        .join(', ');
+
 const markStudentLeft = asyncHandler(async (req, res) => {
-    const data = await studentService.markLeft(req.params.id);
+    const data = await studentService.markLeft(req.params.id, req.body);
+
+    // Nothing changed — they were already Left. Logging it would fill the
+    // history with entries that record nothing, which is how the real ones
+    // become hard to find.
+    if (!data.alreadyLeft) {
+        audit.log({
+            ...audit.fromRequest(req),
+            action: 'student.left',
+            entity: 'Student',
+            entityId: req.params.id,
+            summary: `${data.student.name} (${data.student.admissionNo}) marked as Left`
+                + `${req.body.reason ? ` — ${req.body.reason}` : ''} — ${leavingSummary(data)}`,
+        });
+    }
+
+    return res.status(200).json(
+        new ApiResponse(200, data, data.alreadyLeft ? 'This student had already left' : 'Student marked as Left')
+    );
+});
+
+// ---- transfer certificate ----
+
+// The audit line carries the TC number and the dues it was issued over. That
+// second half is the whole point of the override existing: a certificate handed
+// out with ₹5,000 unpaid is a decision, and a decision with nobody's name on it
+// is indistinguishable from an accident.
+const issueTC = asyncHandler(async (req, res) => {
+    const data = await studentService.issueTC(req.params.id, req.body, { id: req.userId });
 
     audit.log({
         ...audit.fromRequest(req),
-        action: 'student.left',
+        action: 'student.tc.issue',
         entity: 'Student',
         entityId: req.params.id,
-        summary: `${data.student.name} (${data.student.admissionNo}) marked as Left — ₹${data.outstandingCarried} still outstanding`,
+        summary: `${data.tcNo} issued to ${data.name} (${data.admissionNo}, ${data.className})`
+            + `${data.reason ? ` — ${data.reason}` : ''}`
+            + `${data.markedLeft ? ' — also marked as Left' : ''}`
+            + `${data.duesAtIssue > 0 ? ` — issued over ₹${data.duesAtIssue} still outstanding` : ''}`
+            + `${data.creditAtIssue > 0 ? ` — ₹${data.creditAtIssue} still held in advance` : ''}`,
+        after: { tcNo: data.tcNo, duesAtIssue: data.duesAtIssue, creditAtIssue: data.creditAtIssue },
     });
 
-    return res.status(200).json(new ApiResponse(200, data, 'Student marked as Left'));
+    return res.status(201).json(new ApiResponse(201, data, 'Transfer certificate issued'));
+});
+
+const cancelTC = asyncHandler(async (req, res) => {
+    const data = await studentService.cancelTC(req.params.id, req.body.reason);
+
+    audit.log({
+        ...audit.fromRequest(req),
+        action: 'student.tc.cancel',
+        entity: 'Student',
+        entityId: req.params.id,
+        // The number is recorded HERE and nowhere else — the student's own
+        // record is cleared so the next certificate can be issued, and the
+        // counter never hands this number out again. This line is the only
+        // place anybody can be told what TC0007 was.
+        summary: `${data.tcNo} cancelled for ${data.name} — ${req.body.reason}`
+            + `${data.restoredToRoster ? ' — put back on the roster' : ''}`,
+        before: { tcNo: data.tcNo },
+    });
+
+    return res.status(200).json(new ApiResponse(200, data, 'Transfer certificate cancelled'));
+});
+
+// ---- siblings ----
+
+// Linking is an edit to BOTH records, so it rides on `student.edit` rather than
+// adding a 48th permission key for something nobody would grant separately.
+const linkSibling = asyncHandler(async (req, res) => {
+    const data = await studentService.linkSibling(req.params.id, req.body.siblingId);
+
+    audit.log({
+        ...audit.fromRequest(req),
+        action: 'student.sibling.link',
+        entity: 'Student',
+        entityId: req.params.id,
+        summary: data.merged
+            ? `${data.student.name} and ${data.sibling.name} linked — two families merged, ${data.members.length} siblings now`
+            : `${data.student.name} and ${data.sibling.name} (${data.sibling.admissionNo}) linked as siblings`,
+        after: { siblings: data.members.map((m) => `${m.name} (${m.admissionNo})`) },
+    });
+
+    return res.status(200).json(new ApiResponse(200, data, 'Siblings linked'));
+});
+
+const unlinkSibling = asyncHandler(async (req, res) => {
+    const data = await studentService.unlinkSibling(req.params.id, req.params.siblingId);
+
+    audit.log({
+        ...audit.fromRequest(req),
+        action: 'student.sibling.unlink',
+        entity: 'Student',
+        entityId: req.params.id,
+        summary: `${data.removed.name} unlinked from ${data.from}`
+            + (data.remaining === 0 ? ' — no siblings left on either side' : ''),
+    });
+
+    return res.status(200).json(new ApiResponse(200, data, 'Sibling removed'));
 });
 
 // ---- ID cards ----
@@ -242,6 +404,9 @@ module.exports = {
     getActiveSession,
     createSession,
     activateSession,
+    rolloverPlan,
+    rolloverClasses,
+    rolloverPromote,
     updateSession,
     listClasses,
     createClass,
@@ -253,8 +418,12 @@ module.exports = {
     createStudent,
     updateStudent,
     markStudentLeft,
+    linkSibling,
+    unlinkSibling,
     issueIdCard,
     cancelIdCard,
     idCardSummary,
+    issueTC,
+    cancelTC,
     defaulters,
 };

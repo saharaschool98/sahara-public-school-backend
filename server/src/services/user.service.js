@@ -6,8 +6,9 @@ const { userCache } = require('../utils/ttlCache');
 const { ROLES } = require('../utils/permissions');
 
 // A temporary password that is easy to read and say aloud. Ambiguous
-// characters (0/O, 1/l/I) are deliberately excluded — this password gets
-// read over the phone or written down, and "was that 0 or O?" means a
+// characters (0/O, 1/l/I) are deliberately excluded — this password gets read
+// over the phone or written down, and "was that 0 or O?" means a second phone
+// call and a password reset.
 const generateTempPassword = () => {
     const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
     const bytes = crypto.randomBytes(10);

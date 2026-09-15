@@ -15,6 +15,16 @@ const feeDemandSchema = new mongoose.Schema(
         amount: { type: Number, required: true, min: 0 },
         discount: { type: Number, default: 0, min: 0 },
         paidAmount: { type: Number, default: 0, min: 0 },
+        // How much of paidAmount was settled out of an advance the parent had
+        // already handed over, rather than money taken at the counter for this
+        // month. Part of paidAmount, never added to it.
+        //
+        // It is stored because the answer to "which receipt paid October?" has
+        // to exist. Without it the month simply reads Paid with no receipt
+        // behind it, which looks like a bug to anybody checking. It is also
+        // what lets an advance be taken back off the months it has already
+        // settled when its receipt is voided.
+        paidFromCredit: { type: Number, default: 0, min: 0 },
 
         dueDate: { type: Date, default: null },
         status: {

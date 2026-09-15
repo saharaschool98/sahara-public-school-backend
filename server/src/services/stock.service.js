@@ -35,9 +35,10 @@ const resolveStockTarget = (item, variantId) => {
     };
 };
 
-// The only way stock changes. arrayFilters updates the right variant
-// is an $inc — two people selling the same size at once still leave the
-// count correct (read-modify-write would let one update eat the other).
+// The only way stock changes. arrayFilters picks out the right variant and the
+// write itself is an $inc — two people selling the same size at once still
+// leave the count correct (read-modify-write would let one update eat the
+// other).
 const applyStockDelta = async ({ itemId, variantId, delta }, mongoSession) => {
     if (variantId) {
         await StockItem.updateOne(
@@ -141,24 +142,69 @@ const createItem = async (payload, actorId) => {
 // Quantity does NOT change here — it moves only through a purchase, a
 // sale or an adjustment. Otherwise somebody would quietly fix a number
 // and the movement history would start lying.
-const updateItem = async (id, updates) => {
+const updateItem = async (id, updates, actorId) => {
+    const session = await sessionService.getActiveSessionName();
+
     const item = await StockItem.findById(id);
     if (!item) throw new ApiError(404, 'Item not found');
 
     delete updates.currentStock;
+
+    // A size added while editing arrives with an opening count and no history —
+    // the same situation a brand new item is in, and it needs the same OPENING
+    // movement. Without one the quantity simply appeared, and the movement
+    // history could not explain where it came from.
+    const openingRows = [];
 
     if (updates.variants) {
         // Preserve existing variants' stock — only rate and label change
         const bySavedId = new Map(item.variants.map((v) => [v._id.toString(), v]));
         updates.variants = updates.variants.map((v) => {
             const existing = v._id && bySavedId.get(v._id.toString());
-            return existing ? { ...v, currentStock: existing.currentStock } : v;
+            if (existing) return { ...v, currentStock: existing.currentStock };
+            return v;
         });
     }
 
     Object.assign(item, updates);
-    await item.save();
-    return item;
+
+    // Read AFTER the assign, so a new variant already has the _id mongoose gave it.
+    if (updates.variants) {
+        const knownIds = new Set(
+            (updates.variants || [])
+                .filter((v) => v._id)
+                .map((v) => v._id.toString())
+        );
+
+        for (const v of item.variants) {
+            if (knownIds.has(v._id.toString()) || !(v.currentStock > 0)) continue;
+            openingRows.push({
+                session,
+                item: item._id,
+                itemName: item.name,
+                variantId: v._id,
+                variantLabel: v.label,
+                type: 'OPENING',
+                qty: v.currentStock,
+                rate: v.costPrice,
+                balanceAfter: v.currentStock,
+                date: new Date(),
+                note: 'Opening stock for a size added later',
+                by: actorId,
+            });
+        }
+    }
+
+    if (!openingRows.length) {
+        await item.save();
+        return item;
+    }
+
+    return withTransaction(async (mongoSession) => {
+        await item.save({ session: mongoSession });
+        await StockMovement.insertMany(openingRows, { session: mongoSession });
+        return item;
+    });
 };
 
 // ---------------------------------------------------------------------------
@@ -172,17 +218,24 @@ const adjust = async ({ itemId, variantId = null, delta, reason }, actorId) => {
     }
     if (!reason?.trim()) throw new ApiError(400, 'A reason is required for the adjustment');
 
-    const item = await StockItem.findById(itemId).lean();
-    if (!item) throw new ApiError(404, 'Item not found');
-
-    const target = resolveStockTarget(item, variantId);
-    const after = target.currentStock + delta;
-
-    if (after < 0) {
-        throw new ApiError(400, `Stock cannot go negative — there are ${target.currentStock} right now`);
-    }
-
     return withTransaction(async (mongoSession) => {
+        // Read inside the transaction: the "cannot go negative" check has to be
+        // made against the count this write is about to change. Read outside it,
+        // two adjustments started together both saw the same 3 in stock, both
+        // passed a -3, and the shelf ended up at -3.
+        const item = await StockItem.findById(itemId).session(mongoSession).lean();
+        if (!item) throw new ApiError(404, 'Item not found');
+
+        const target = resolveStockTarget(item, variantId);
+        const after = target.currentStock + delta;
+
+        if (after < 0) {
+            throw new ApiError(
+                400,
+                `Stock cannot go negative — there are ${target.currentStock} right now`
+            );
+        }
+
         await applyStockDelta({ itemId, variantId, delta }, mongoSession);
 
         const [movement] = await StockMovement.create(

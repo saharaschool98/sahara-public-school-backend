@@ -36,7 +36,7 @@ const createItem = asyncHandler(async (req, res) => {
 // no other trace — a sale records the rate it used, not who set it.
 const updateItem = asyncHandler(async (req, res) => {
     const before = await audit.snapshot(StockItem, req.params.id, 'StockItem');
-    const data = await stockService.updateItem(req.params.id, req.body);
+    const data = await stockService.updateItem(req.params.id, req.body, req.userId);
 
     audit.logEdit(req, {
         action: 'stock.itemUpdate',

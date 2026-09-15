@@ -6,9 +6,9 @@ const { config } = require('./env');
 //
 // On Vercel every request is a function invocation. Without caching, each
 // invocation would open its own connection — TLS handshake + auth + topology
-// discovery = 200-400ms, BEFORE the first query even runs. Caching the promise on globalThis
-// discovery. Caching lets a warm instance reuse the same socket, which
-// brings that cost down to single-digit milliseconds.
+// discovery = 200-400ms, BEFORE the first query even runs. Caching the promise
+// lets a warm instance reuse the same socket, which brings that cost down to
+// single-digit milliseconds.
 //
 // globalThis rather than a module-level variable: a module variable would
 // work, but globalThis states the intent — "for the whole lifetime of this
@@ -31,8 +31,8 @@ const connectDB = async () => {
         mongoose.set('autoIndex', !config.isProd);
         mongoose.set('strictQuery', true);
         // A safety net on every query — one pathological query must not eat the
-        // cannot eat the whole 10s budget. This is NOT a connection option
-        // (the driver rejects it there) — it is a mongoose query default.
+        // whole 10s function budget. This is NOT a connection option (the driver
+        // rejects it there) — it is a mongoose query default.
         mongoose.set('maxTimeMS', 8000);
 
         cached.promise = mongoose

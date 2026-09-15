@@ -11,9 +11,13 @@ const mongoose = require('mongoose');
 // Atlas is a replica set (M0 included), so transactions are supported.
 //
 // Retry on TransientTransactionError: a write conflict on a replica set is
-// is normal (two people touching the same document at once). Mongo itself
-// marks it retryable — without honouring that label we would fail a
-// request that would have succeeded on a second run.
+// normal (two people touching the same document at once). Mongo itself marks it
+// retryable — without honouring that label we would fail a request that would
+// have succeeded on a second run.
+//
+// The retry is also what makes reading INSIDE a transaction safe: the second
+// attempt re-runs the whole callback, so it re-reads the rows the first attempt
+// lost the race on, and decides again on current numbers.
 // ---------------------------------------------------------------------------
 
 const MAX_RETRIES = 3;
@@ -47,8 +51,8 @@ const withTransaction = async (fn) => {
 
                 if (!transient || attempt >= MAX_RETRIES) throw err;
 
-                // Small exponential backoff — retrying instantly tends to hit
-                // conflict happens again.
+                // Small exponential backoff — retrying instantly tends to hit the
+                // same conflict again.
                 await new Promise((r) => setTimeout(r, 40 * attempt));
             }
         }
